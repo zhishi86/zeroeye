@@ -36,6 +36,7 @@ import ssl
 import subprocess
 import sys
 import time
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,60 @@ MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
 # Transient error indicators — errors that may succeed on retry
+
+# Rate limiter (token bucket)
+class TokenBucket:
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.tokens = float(rate)
+        self.last_refill = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> float:
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
+            self.last_refill = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return 0.0
+            wait = (1.0 - self.tokens) / self.rate if self.rate > 0 else 0.0
+            return wait
+
+# Circuit breaker states
+CIRCUIT_STATES = {"CLOSED": "CLOSED", "OPEN": "OPEN", "HALF_OPEN": "HALF_OPEN"}
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0):
+        self.threshold = failure_threshold
+        self.recovery = recovery_timeout
+        self.fails = 0
+        self.state = "CLOSED"
+        self.last_fail = 0.0
+        self.lock = threading.Lock()
+
+    def ok(self):
+        with self.lock: self.fails = 0; self.state = "CLOSED"
+
+    def fail(self):
+        with self.lock:
+            self.fails += 1
+            self.last_fail = time.time()
+            if self.fails >= self.threshold:
+                self.state = "OPEN"
+
+    def allow(self) -> bool:
+        with self.lock:
+            if self.state == "CLOSED":
+                return True
+            if self.state == "OPEN" and (time.time() - self.last_fail) >= self.recovery:
+                self.state = "HALF_OPEN"
+                return True
+            return self.state == "HALF_OPEN"
+
+    def rate_mult(self) -> float:
+        return {"CLOSED": 1.0, "OPEN": 0.0, "HALF_OPEN": 0.5}.get(self.state, 1.0)
 _TRANSIENT_ERRORS = (
     socket.timeout,
     TimeoutError,
@@ -279,6 +334,8 @@ def run_health_checks(
     json_output: bool = False,
     retry_count: int = 2,
     backoff_interval: float = 1.0,
+    probe_rate: float = 10.0,
+    timeout_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
@@ -290,14 +347,35 @@ def run_health_checks(
     }
 
     all_ok = True
+    rate_limiter = TokenBucket(probe_rate) if probe_rate > 0 else None
+    breakers = {}
+
+    def _check_with_circuit(name, check_fn, retry_c, backoff_i, *args):
+        nonlocal all_ok
+        if name not in breakers:
+            breakers[name] = CircuitBreaker()
+        cb = breakers[name]
+        if not cb.allow():
+            return "CRITICAL", "Circuit breaker OPEN", {"retry_attempts": 0, "final_latency_ms": 0.0}
+        if rate_limiter:
+            wait = rate_limiter.acquire()
+            if wait > 0:
+                time.sleep(wait)
+        status, detail, meta = with_retry(check_fn, retry_c, backoff_i, *args)
+        if status == "CRITICAL":
+            cb.fail()
+        else:
+            cb.ok()
+        return status, detail, meta
 
     # Check services (HTTP)
     for name, config in SERVICES.items():
         if service and name != service:
             continue
-        status, detail, meta = with_retry(
-            check_http_service, retry_count, backoff_interval,
-            config["host"], config["port"], config["path"], config["timeout"]
+        timeout = timeout_override or config["timeout"]
+        status, detail, meta = _check_with_circuit(
+            name, check_http_service, retry_count, backoff_interval,
+            config["host"], config["port"], config["path"], timeout
         )
         entry = {
             "status": status,
@@ -315,9 +393,10 @@ def run_health_checks(
     for name, config in INFRASTRUCTURE.items():
         if service and name != service:
             continue
-        status, detail, meta = with_retry(
-            check_tcp_port, retry_count, backoff_interval,
-            config["host"], config["port"], config["timeout"]
+        timeout = timeout_override or config["timeout"]
+        status, detail, meta = _check_with_circuit(
+            name, check_tcp_port, retry_count, backoff_interval,
+            config["host"], config["port"], timeout
         )
         entry = {
             "status": status,
@@ -406,6 +485,14 @@ def parse_args():
     parser.add_argument(
         "--backoff-interval", type=float, default=1.0,
         help="Initial backoff interval in seconds between retries (default: 1.0, doubles each retry)"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="Override timeout for all checks (seconds)"
+    )
+    parser.add_argument(
+        "--probe-rate", type=float, default=10.0,
+        help="Max probes per second (default: 10, 0=unlimited)"
     )
     return parser.parse_args()
 
